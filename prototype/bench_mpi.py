@@ -89,8 +89,8 @@ def run_mpi_benchmark():
     comm.Barrier()
     t0 = time.time()
     engine_hilbert = DistributedMPIHilbertEngine(
-        X=X, A=A, p=10, max_leaf_size=max_leaf_size,
-        subspace_dim=2, comm=comm
+        X=X, A=A, p=14, max_leaf_size=max_leaf_size,
+        primary_dim=4, comm=comm
     )
     comm.Barrier()
     hilbert_build_time = time.time() - t0
@@ -256,6 +256,8 @@ def run_mpi_benchmark():
         print("\n" + "=" * 115)
         print("Distributed Comparative Benchmark Completed Successfully!")
         print("=" * 115)
+
+    engine_hilbert.close()
 
 
 if __name__ == "__main__":

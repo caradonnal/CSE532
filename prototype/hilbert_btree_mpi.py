@@ -61,16 +61,14 @@ def get_mpi_comm():
 class DistributedMPIHilbertEngine:
     """Distributed Vector Engine distributing Hilbert partition subgraphs across MPI ranks."""
 
-    def __init__(self, X=None, A=None, p=10, max_leaf_size=20000,
-                 subspace_dim=2, subspaces=None, comm=None):
+    def __init__(self, X=None, A=None, p=14, max_leaf_size=20000,
+                 primary_dim=4, comm=None, **kwargs):
         self.comm = comm or get_mpi_comm()
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
         self.p = p
         self.max_leaf_size = max_leaf_size
-        self.subspace_dim = subspace_dim
-        self.subspaces = subspaces
-
+        self.primary_dim = primary_dim
         self.local_leaves = []
         self.space = None
 
@@ -78,17 +76,17 @@ class DistributedMPIHilbertEngine:
             assert X is not None and A is not None, "Rank 0 must provide X and A for initialization"
             self.n, self.d = X.shape
             self.m = A.shape[1]
+            self.primary_dim = min(4, self.m)
             amin = A.min(axis=0)
             amax = A.max(axis=0)
             meta = {
                 "n": self.n,
                 "d": self.d,
                 "m": self.m,
+                "primary_dim": self.primary_dim,
                 "amin": amin,
                 "amax": amax,
                 "p": self.p,
-                "subspace_dim": self.subspace_dim,
-                "subspaces": self.subspaces,
             }
         else:
             meta = None
@@ -98,17 +96,17 @@ class DistributedMPIHilbertEngine:
         self.n = meta["n"]
         self.d = meta["d"]
         self.m = meta["m"]
-        self.space = HilbertSpace(meta["amin"], meta["amax"], p=meta["p"], m=self.m,
-                                  subspace_dim=meta["subspace_dim"], subspaces=meta["subspaces"])
+        self.primary_dim = meta.get("primary_dim", min(4, self.m))
+        self.space = HilbertSpace(meta["amin"], meta["amax"], p=meta["p"], m=self.m, primary_dim=self.primary_dim)
 
         # Step 2: Bulk partition and distribute to ranks
         self._distribute_data(X, A)
 
     def _distribute_data(self, X, A):
-        """Rank 0 partitions data by master Hilbert key and scatters assigned chunks to ranks."""
+        """Rank 0 partitions data by 4D Hilbert key and scatters assigned chunks to ranks."""
         if self.rank == 0:
             t0 = time.time()
-            Aq = self.space.quantize(A)
+            Aq = self.space.quantize_primary(A)
             keys = self.space.points_to_keys(Aq)
             order = np.argsort(keys)
 
@@ -146,7 +144,7 @@ class DistributedMPIHilbertEngine:
         else:
             my_leaves_data = rank_assignments[0] if rank_assignments else []
 
-        # Each rank builds its assigned local leaf subgraphs
+        # Each rank builds its assigned local leaf subgraphs and Parquet-style columnar files
         t_build_start = time.time()
         for leaf_dict in my_leaves_data:
             deg = GraphSparsityTuner(GraphSparsityTuner.compute_apd(leaf_dict["X"])).compute_degree(leaf_dict["X"])
@@ -159,11 +157,24 @@ class DistributedMPIHilbertEngine:
                 leaf_dict["keys"],
                 leaf_dict["gids"],
                 M=deg,
+                primary_dim=self.primary_dim,
             )
             self.local_leaves.append(leaf)
 
         self.local_build_time = time.time() - t_build_start
         self.comm.Barrier()
+
+    def close(self):
+        """Closes all leaf columnar file resources on this rank."""
+        if hasattr(self, "local_leaves") and self.local_leaves:
+            for leaf in self.local_leaves:
+                leaf.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def get_rank_memory_footprint(self):
         """Calculates memory breakdown for the subgraphs hosted on this MPI rank."""
@@ -231,7 +242,7 @@ class DistributedMPIHilbertEngine:
                 if len(matching_ids) == 0:
                     continue
 
-                scan_thresh = max(500, int(0.15 * self.max_leaf_size))
+                scan_thresh = max(1000, int(0.25 * self.max_leaf_size))
                 if len(matching_ids) <= scan_thresh:
                     ids, dists, nd = leaf.search_scan(q, matching_ids, k=k)
                 else:

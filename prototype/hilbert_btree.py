@@ -15,7 +15,10 @@ Key Architectural Components:
 
 import concurrent.futures
 import heapq
+import json
 import os
+import struct
+import tempfile
 import threading
 import time
 import numpy as np
@@ -270,35 +273,188 @@ def deinterleave_subspace_keys(master_keys, S, bits=16):
     return out
 
 
-class HilbertSpace:
-    """Handles m-dimensional scalar attribute quantization and Subspace Hilbert curve bit-interleaving."""
+class LeafColumnarStorage:
+    """Parquet-style columnar storage engine for secondary attributes within a leaf subgraph.
 
-    def __init__(self, amin, amax, p=10, m=2, subspace_dim=2, subspaces=None):
-        self.p = p
+    Architectural Features:
+      1. Columnar Memory-Mapped Layout: Secondary attributes [4..m-1] are stored contiguously by
+         column chunk rather than row-by-row.
+      2. Column Projection: Queries only touch and read the memory for active filtered columns,
+         leaving unqueried secondary attributes unread in cache/memory.
+      3. Row Group Chunking & Zone Maps: Divides rows into groups (default 2048 rows), storing
+         min/max statistics per column per row group to skip non-matching blocks in O(1).
+      4. Vectorized SIMD Filtering: Surviving row groups are evaluated via NumPy SIMD boolean masks.
+      5. File Backing: Writes dedicated columnar files ('leaf_{leaf_id:05d}_secondary.pcol')
+         with magic bytes b'PAR1_COL', header metadata, column chunks, and footer.
+    """
+    MAGIC = b"PAR1_COL"
+
+    def __init__(self, leaf_id, secondary_attrs, col_names=None, row_group_size=2048, storage_dir=None):
+        self.leaf_id = leaf_id
+        self.row_group_size = row_group_size
+        self.secondary_attrs = np.ascontiguousarray(secondary_attrs, dtype=np.float32)
+        if self.secondary_attrs.ndim == 1:
+            self.secondary_attrs = self.secondary_attrs[:, None]
+        self.num_rows, self.num_cols = self.secondary_attrs.shape
+        self.col_names = col_names or [f"sec_attr_{i}" for i in range(self.num_cols)]
+
+        if storage_dir is None:
+            self.storage_dir = os.path.join(tempfile.gettempdir(), "cse532_leaf_columnar")
+        else:
+            self.storage_dir = storage_dir
+        os.makedirs(self.storage_dir, exist_ok=True)
+        self.file_path = os.path.join(self.storage_dir, f"leaf_{self.leaf_id:05d}_secondary.pcol")
+
+        self.num_row_groups = int(np.ceil(self.num_rows / self.row_group_size)) if self.num_rows > 0 else 0
+        self.row_group_stats = []
+        self._fp = None
+        self._mmap = None
+        self._write_columnar_file()
+        self._open_mmap()
+
+    def _write_columnar_file(self):
+        """Serializes secondary attributes into a binary Parquet-style columnar file."""
+        with open(self.file_path, "wb") as f:
+            f.write(self.MAGIC)
+            header_dict = {
+                "leaf_id": self.leaf_id,
+                "num_rows": self.num_rows,
+                "num_cols": self.num_cols,
+                "num_row_groups": self.num_row_groups,
+                "row_group_size": self.row_group_size,
+                "col_names": self.col_names,
+            }
+            hdr_bytes = json.dumps(header_dict).encode("utf-8")
+            f.write(struct.pack("<I", len(hdr_bytes)))
+            f.write(hdr_bytes)
+
+            stats = []
+            for g in range(self.num_row_groups):
+                r_start = g * self.row_group_size
+                r_end = min(self.num_rows, (g + 1) * self.row_group_size)
+                chunk_slice = self.secondary_attrs[r_start:r_end]
+
+                group_stats = []
+                for c in range(self.num_cols):
+                    col_data = np.ascontiguousarray(chunk_slice[:, c], dtype=np.float32)
+                    c_min = float(col_data.min()) if len(col_data) > 0 else 0.0
+                    c_max = float(col_data.max()) if len(col_data) > 0 else 0.0
+                    offset = f.tell()
+                    raw_bytes = col_data.tobytes()
+                    f.write(raw_bytes)
+                    group_stats.append({
+                        "min": c_min,
+                        "max": c_max,
+                        "offset": offset,
+                        "nbytes": len(raw_bytes),
+                        "nrows": len(col_data),
+                    })
+                stats.append(group_stats)
+
+            # Footer: metadata and row-group Zone Maps
+            meta_bytes = json.dumps(stats).encode("utf-8")
+            f.write(meta_bytes)
+            f.write(struct.pack("<I", len(meta_bytes)))
+            f.write(self.MAGIC)
+
+        self.row_group_stats = stats
+        self.file_size_bytes = os.path.getsize(self.file_path)
+
+    def _open_mmap(self):
+        if self.file_size_bytes > 0:
+            self._fp = open(self.file_path, "rb")
+            self._mmap = np.memmap(self._fp, mode="r")
+
+    def filter_secondary(self, lo_sec, hi_sec, active_cols=None):
+        """Applies column projection and row-group Zone Map pruning on secondary attributes.
+
+        Returns:
+            np.ndarray: Indices of rows inside this leaf matching the secondary attribute predicate.
+        """
+        if self.num_rows == 0 or self.num_cols == 0:
+            return np.arange(self.num_rows, dtype=np.int64)
+
+        lo_sec = np.asarray(lo_sec, dtype=np.float32)
+        hi_sec = np.asarray(hi_sec, dtype=np.float32)
+
+        if active_cols is None:
+            active_cols = [c for c in range(min(len(lo_sec), self.num_cols))
+                           if lo_sec[c] > -1e30 or hi_sec[c] < 1e30]
+
+        if not active_cols:
+            return np.arange(self.num_rows, dtype=np.int64)
+
+        matching_chunks = []
+        for g, group_stat in enumerate(self.row_group_stats):
+            r_start = g * self.row_group_size
+
+            # 1. Row-group Zone Map Pruning: skip chunk if any active column is disjoint
+            skip_chunk = False
+            for c in active_cols:
+                if group_stat[c]["min"] > hi_sec[c] or group_stat[c]["max"] < lo_sec[c]:
+                    skip_chunk = True
+                    break
+            if skip_chunk:
+                continue
+
+            # 2. Column Projection & SIMD vectorized evaluation on surviving chunk
+            nrows = group_stat[active_cols[0]]["nrows"]
+            chunk_mask = np.ones(nrows, dtype=bool)
+
+            for c in active_cols:
+                offset = group_stat[c]["offset"]
+                nbytes = group_stat[c]["nbytes"]
+                if self._mmap is not None:
+                    col_data = np.frombuffer(self._mmap[offset:offset + nbytes], dtype=np.float32)
+                else:
+                    self._fp.seek(offset)
+                    col_data = np.frombuffer(self._fp.read(nbytes), dtype=np.float32)
+
+                chunk_mask &= (col_data >= lo_sec[c]) & (col_data <= hi_sec[c])
+                if not np.any(chunk_mask):
+                    break
+
+            if np.any(chunk_mask):
+                local_match = np.where(chunk_mask)[0] + r_start
+                matching_chunks.append(local_match)
+
+        if matching_chunks:
+            return np.concatenate(matching_chunks)
+        return np.empty(0, dtype=np.int64)
+
+    def close(self):
+        if hasattr(self, "_mmap") and self._mmap is not None:
+            del self._mmap
+            self._mmap = None
+        if hasattr(self, "_fp") and self._fp is not None:
+            self._fp.close()
+            self._fp = None
+
+    def __del__(self):
+        self.close()
+
+
+class HilbertSpace:
+    """Handles multi-attribute quantization via a 4-Dimensional Hilbert Curve
+    over primary clustering attributes [0..3], delegating secondary attributes [4..m-1]
+    to per-leaf Parquet-style columnar storage files.
+    """
+
+    def __init__(self, amin, amax, p=14, m=4, primary_dim=4, **kwargs):
         self.m = m
+        self.primary_dim = min(primary_dim, m)
+        # Precision p for 4D Hilbert curve (4 * 15 = 60 <= 63 bits in uint64)
+        if self.primary_dim > 0:
+            self.p = min(15, 60 // self.primary_dim)
+        else:
+            self.p = p
         self.amin = np.asarray(amin, dtype=np.float64)
         self.amax = np.asarray(amax, dtype=np.float64)
         self.span = np.where(self.amax > self.amin, self.amax - self.amin, 1.0)
 
-        # Configure subspaces: group attributes into low-dimensional subspaces (default 2D pairs)
-        if subspaces is not None:
-            self.subspaces = [list(s) for s in subspaces]
-        elif m <= subspace_dim:
-            self.subspaces = [list(range(m))]
-        else:
-            self.subspaces = [list(range(i, min(i + subspace_dim, m))) for i in range(0, m, subspace_dim)]
-
-        self.S = len(self.subspaces)
-        self.sub_dims = [len(s) for s in self.subspaces]
-        total_dims = sum(self.sub_dims)
-        # Adapt p if total key bits exceed 60
-        if total_dims * self.p > 60:
-            self.p = max(2, 60 // total_dims)
-        total_bits = sum(d * self.p for d in self.sub_dims)
-        assert total_bits <= 63, f"Total key bits ({total_bits}) must fit in uint64 (<= 63 bits)"
-
-        self.curves = [HilbertCurve(self.p, d) for d in self.sub_dims]
-        self.bits_per_sub = self.p * max(self.sub_dims)
+        # True 4-Dimensional Hilbert Curve over primary dimensions
+        self.curve = HilbertCurve(self.p, self.primary_dim)
+        total_bits = self.primary_dim * self.p
         self.max_key = np.uint64((1 << total_bits) - 1)
 
     def quantize(self, A):
@@ -307,34 +463,31 @@ class HilbertSpace:
         q = np.floor((A - self.amin) / self.span * (2**self.p - 1) + 0.5)
         return np.clip(q, 0, 2**self.p - 1).astype(np.int64)
 
+    def quantize_primary(self, A):
+        """Quantizes the primary clustering attributes [0 .. primary_dim-1]."""
+        A = np.asarray(A, dtype=np.float64)
+        if A.ndim == 1:
+            A = A[None, :]
+        q = np.floor((A[:, :self.primary_dim] - self.amin[:self.primary_dim]) /
+                     self.span[:self.primary_dim] * (2**self.p - 1) + 0.5)
+        return np.clip(q, 0, 2**self.p - 1).astype(np.int64)
+
     def points_to_keys(self, Aq):
-        """Converts quantized points to 1D uint64 bit-interleaved Subspace Hilbert keys."""
+        """Converts quantized points to 1D uint64 keys via the 4-Dimensional Hilbert Curve."""
         Aq = np.asarray(Aq, dtype=np.int64)
         if len(Aq) == 0:
             return np.empty(0, dtype=np.uint64)
-
-        if self.S == 1:
-            keys = self.curves[0].distances_from_points(Aq.tolist())
-            return np.array(keys, dtype=np.uint64)
-
-        sub_keys = []
-        for s_idx, dims in enumerate(self.subspaces):
-            sub_pts = Aq[:, dims]
-            k = self.curves[s_idx].distances_from_points(sub_pts.tolist())
-            sub_keys.append(np.array(k, dtype=np.uint64))
-
-        return interleave_subspace_keys(sub_keys, bits=self.bits_per_sub)
+        primary_pts = Aq[:, :self.primary_dim]
+        keys = self.curve.distances_from_points(primary_pts.tolist())
+        return np.array(keys, dtype=np.uint64)
 
     def decompose(self, lo_raw, hi_raw, max_depth=6):
-        """Decomposes an m-dimensional bounding box [lo_raw, hi_raw] into disjoint
-        merged 1D bit-interleaved Hilbert key intervals [start, end).
-        For high dimensions (m > 4), octree recursion explodes (2^m >= 32); in this regime,
-        the Zone Map handles chunk pruning directly, so we return an empty interval list.
+        """Decomposes a 4D bounding box [lo_raw[:4], hi_raw[:4]] into disjoint
+        merged 1D Hilbert key intervals [start, end).
         """
-        if self.m > 4:
-            return []
-        lo = self.quantize(lo_raw)
-        hi = self.quantize(hi_raw)
+        lo = self.quantize_primary(lo_raw)[0]
+        hi = self.quantize_primary(hi_raw)[0]
+        d = self.primary_dim
         max_depth = min(self.p, max_depth)
         out = []
 
@@ -344,17 +497,17 @@ class HilbertSpace:
             if np.any(cmax < lo) or np.any(corner > hi):
                 return
             if (np.all(corner >= lo) and np.all(cmax <= hi)) or level == max_depth:
-                size = 1 << (self.m * (self.p - level))
+                size = 1 << (d * (self.p - level))
                 ck = self.points_to_keys(corner[None])[0]
                 start = (ck // size) * size
                 out.append((start, start + size))
                 return
             half = side >> 1
-            for bits in range(1 << self.m):
-                off = np.array([(bits >> j) & 1 for j in range(self.m)]) * half
+            for bits in range(1 << d):
+                off = np.array([(bits >> j) & 1 for j in range(d)]) * half
                 rec(level + 1, corner + off)
 
-        rec(0, np.zeros(self.m, dtype=np.int64))
+        rec(0, np.zeros(d, dtype=np.int64))
         if not out:
             return []
         out.sort()
@@ -406,7 +559,7 @@ class GraphSparsityTuner:
 class LeafSubgraph:
     """A dedicated, independent HNSW subgraph over a disjoint Hilbert key range [k_min, k_max)."""
 
-    def __init__(self, leaf_id, k_min, k_max, X, A, keys, global_ids, M=20, ef_construction=100):
+    def __init__(self, leaf_id, k_min, k_max, X, A, keys, global_ids, M=20, ef_construction=100, primary_dim=4, storage_dir=None):
         self.leaf_id = leaf_id
         self.k_min = np.uint64(k_min)
         self.k_max = np.uint64(k_max)
@@ -415,8 +568,23 @@ class LeafSubgraph:
         self.keys = np.asarray(keys, dtype=np.uint64)
         self.global_ids = np.asarray(global_ids, dtype=np.int64)
         self.n, self.d = self.X.shape
+        self.m = self.A.shape[1] if self.A.ndim > 1 else 1
+        self.primary_dim = min(primary_dim, self.m)
         self.M = M
         self.ef_construction = ef_construction
+
+        # 1. Parquet-style Columnar Storage File for secondary attributes [primary_dim .. m-1]
+        if self.m > self.primary_dim and self.n > 0:
+            sec_attrs = self.A[:, self.primary_dim:]
+            col_names = [f"sec_attr_{i}" for i in range(self.primary_dim, self.m)]
+            self.columnar_store = LeafColumnarStorage(
+                leaf_id=self.leaf_id,
+                secondary_attrs=sec_attrs,
+                col_names=col_names,
+                storage_dir=storage_dir,
+            )
+        else:
+            self.columnar_store = None
 
         # Sort internal elements by Hilbert key for fast local binary searches
         self.order = np.argsort(self.keys, kind="stable")
@@ -450,6 +618,14 @@ class LeafSubgraph:
         self.offs = faiss.vector_to_array(h.offsets)
         self.nb0 = h.nb_neighbors(0)
 
+    def close(self):
+        """Closes any underlying columnar storage file handles."""
+        if hasattr(self, "columnar_store") and self.columnar_store is not None:
+            self.columnar_store.close()
+
+    def __del__(self):
+        self.close()
+
     def get_memory_bytes(self):
         """Returns detailed memory breakdown in bytes for this leaf partition."""
         faiss_bytes = len(faiss.serialize_index(self.index)) if self.index is not None else 0
@@ -457,6 +633,7 @@ class LeafSubgraph:
         attr_bytes = self.A.nbytes
         key_bytes = self.keys.nbytes + self.skeys.nbytes + self.order.nbytes
         id_bytes = self.global_ids.nbytes
+        col_file_bytes = self.columnar_store.file_size_bytes if self.columnar_store is not None else 0
         meta_bytes = self.attr_min.nbytes + self.attr_max.nbytes + self.centroid.nbytes + 8
         pure_graph_bytes = max(0, faiss_bytes - raw_vec_bytes)
         return {
@@ -466,8 +643,9 @@ class LeafSubgraph:
             "attr_bytes": attr_bytes,
             "key_bytes": key_bytes,
             "id_bytes": id_bytes,
+            "col_file_bytes": col_file_bytes,
             "meta_bytes": meta_bytes,
-            "total_bytes": faiss_bytes + attr_bytes + key_bytes + id_bytes + meta_bytes,
+            "total_bytes": faiss_bytes + attr_bytes + key_bytes + id_bytes + meta_bytes + col_file_bytes,
         }
 
     def dist(self, q, local_ids):
@@ -476,10 +654,17 @@ class LeafSubgraph:
         return np.einsum("ij,ij->i", diff, diff)
 
     def find_matching_local(self, intervals, lo_raw, hi_raw, space):
-        """Finds local matching indices inside this leaf."""
+        """Finds local matching indices inside this leaf using 4D Hilbert key intervals
+        and Parquet-style columnar storage for secondary attributes.
+        """
+        p_dim = self.primary_dim
+        lo_p = lo_raw[:p_dim]
+        hi_p = hi_raw[:p_dim]
+
+        # 1. Primary Attributes Filter [0 .. primary_dim-1] via 4D Hilbert Curve / Zone Map
         if intervals:
-            lo_q = space.quantize(lo_raw)
-            hi_q = space.quantize(hi_raw)
+            lo_q = space.quantize_primary(lo_p)
+            hi_q = space.quantize_primary(hi_p)
             sk = self.skeys
             slices = []
             for s, e in intervals:
@@ -495,14 +680,29 @@ class LeafSubgraph:
             if not slices:
                 return np.empty(0, dtype=np.int64)
             cands = np.concatenate([self.order[a:b] for a, b in slices])
-            # Exact scalar refinement
-            aq = space.quantize(self.A[cands])
-            valid_mask = np.all((aq >= lo_q) & (aq <= hi_q), axis=1)
-            return cands[valid_mask]
+            primary_mask = np.all((self.A[cands, :p_dim] >= lo_p) & (self.A[cands, :p_dim] <= hi_p), axis=1)
+            primary_matches = cands[primary_mask]
+        else:
+            primary_mask = np.all((self.A[:, :p_dim] >= lo_p) & (self.A[:, :p_dim] <= hi_p), axis=1)
+            primary_matches = np.where(primary_mask)[0]
 
-        # Fast SIMD vectorized match over leaf attributes when intervals is None/empty
-        valid_mask = np.all((self.A >= lo_raw) & (self.A <= hi_raw), axis=1)
-        return np.where(valid_mask)[0]
+        if len(primary_matches) == 0:
+            return np.empty(0, dtype=np.int64)
+
+        # 2. Secondary Attributes Filter [primary_dim .. m-1] via Leaf Columnar Storage File
+        if self.columnar_store is not None and self.m > p_dim:
+            lo_sec = lo_raw[p_dim:]
+            hi_sec = hi_raw[p_dim:]
+            has_sec_constraints = np.any((lo_sec > -1e30) | (hi_sec < 1e30))
+            if has_sec_constraints:
+                sec_matches = self.columnar_store.filter_secondary(lo_sec, hi_sec)
+                if len(sec_matches) == 0:
+                    return np.empty(0, dtype=np.int64)
+                if len(primary_matches) < self.n:
+                    return np.intersect1d(primary_matches, sec_matches, assume_unique=True)
+                return sec_matches
+
+        return primary_matches
 
     def search_unconstrained(self, q, k=10, ef=64, shared_state=None):
         """Mode 1: Pure Vanilla Unconstrained HNSW (0% filtering overhead)."""
@@ -762,9 +962,11 @@ class TemporalBuffer:
         self.buf_keys.clear()
         self.buf_ids.clear()
 
+        self.primary_dim = getattr(space, "primary_dim", 4)
         if not self.router.leaves:
             deg = self.tuner.compute_degree(bX)
-            leaf = LeafSubgraph(0, np.uint64(0), self.space.max_key, bX, bA, bKeys, bIds, M=deg)
+            leaf = LeafSubgraph(0, np.uint64(0), self.space.max_key, bX, bA, bKeys, bIds, M=deg,
+                                primary_dim=self.primary_dim)
             self.router.add_leaf(leaf)
             return
 
@@ -785,36 +987,45 @@ class TemporalBuffer:
                     left_idx = order[:mid]
                     right_idx = order[mid:]
 
+                    leaf.close()
                     self.router.leaves.remove(leaf)
 
                     deg_l = self.tuner.compute_degree(nX[left_idx])
                     deg_r = self.tuner.compute_degree(nX[right_idx])
 
                     leaf_l = LeafSubgraph(self.next_leaf_id, leaf.k_min, mid_key,
-                                          nX[left_idx], nA[left_idx], nKeys[left_idx], nIds[left_idx], M=deg_l)
+                                          nX[left_idx], nA[left_idx], nKeys[left_idx], nIds[left_idx], M=deg_l,
+                                          primary_dim=self.primary_dim)
                     self.next_leaf_id += 1
                     leaf_r = LeafSubgraph(self.next_leaf_id, mid_key, leaf.k_max,
-                                          nX[right_idx], nA[right_idx], nKeys[right_idx], nIds[right_idx], M=deg_r)
+                                          nX[right_idx], nA[right_idx], nKeys[right_idx], nIds[right_idx], M=deg_r,
+                                          primary_dim=self.primary_dim)
                     self.next_leaf_id += 1
 
                     self.router.add_leaf(leaf_l)
                     self.router.add_leaf(leaf_r)
                 else:
+                    leaf.close()
                     self.router.leaves.remove(leaf)
                     deg = self.tuner.compute_degree(nX)
                     new_leaf = LeafSubgraph(leaf.leaf_id, leaf.k_min, leaf.k_max,
-                                            nX, nA, nKeys, nIds, M=deg)
+                                            nX, nA, nKeys, nIds, M=deg,
+                                            primary_dim=self.primary_dim)
                     self.router.add_leaf(new_leaf)
 
 
 class HilbertHNSWEngine:
-    """The Complete Hilbert-Partitioned B-Tree Vector Engine."""
+    """The Complete Hilbert-Partitioned B-Tree Vector Engine with 4D Hilbert Curve
+    and Parquet-Style Columnar Storage for Secondary Attributes.
+    """
 
-    def __init__(self, X, A, p=10, max_leaf_size=10000, buf_capacity=2000,
+    def __init__(self, X, A, p=14, max_leaf_size=10000, buf_capacity=2000,
                  M_min=12, M_max=32, M_base=20, scan_threshold=None, num_threads=None,
-                 subspace_dim=2, subspaces=None):
+                 primary_dim=4, storage_dir=None, **kwargs):
         self.n, self.d = X.shape
         self.m = A.shape[1]
+        self.primary_dim = min(primary_dim, self.m)
+        self.storage_dir = storage_dir
         self.p = p
         self.max_leaf_size = max_leaf_size
         self.buf_capacity = buf_capacity
@@ -830,8 +1041,7 @@ class HilbertHNSWEngine:
 
         amin = A.min(axis=0)
         amax = A.max(axis=0)
-        self.space = HilbertSpace(amin, amax, p=p, m=self.m,
-                                  subspace_dim=subspace_dim, subspaces=subspaces)
+        self.space = HilbertSpace(amin, amax, p=p, m=self.m, primary_dim=self.primary_dim)
         global_apd = GraphSparsityTuner.compute_apd(X)
         self.tuner = GraphSparsityTuner(global_apd, M_min=M_min, M_max=M_max, M_base=M_base)
 
@@ -842,7 +1052,10 @@ class HilbertHNSWEngine:
         self._bulk_load(X, A)
 
     def close(self):
-        """Shuts down the internal ThreadPoolExecutor."""
+        """Shuts down executor and closes leaf columnar storage files."""
+        if hasattr(self, "router") and self.router is not None:
+            for leaf in self.router.leaves:
+                leaf.close()
         if hasattr(self, "executor") and self.executor is not None:
             self.executor.shutdown(wait=False)
             self.executor = None
@@ -857,8 +1070,8 @@ class HilbertHNSWEngine:
         self.close()
 
     def _bulk_load(self, X, A):
-        """Initial bulk partitioning along Hilbert space."""
-        Aq = self.space.quantize(A)
+        """Initial bulk partitioning along 4D Hilbert space."""
+        Aq = self.space.quantize_primary(A)
         keys = self.space.points_to_keys(Aq)
         order = np.argsort(keys)
 
@@ -878,7 +1091,8 @@ class HilbertHNSWEngine:
 
             deg = self.tuner.compute_degree(X[chunk_idx])
             leaf = LeafSubgraph(i, k_start, k_end,
-                                X[chunk_idx], A[chunk_idx], chunk_keys, chunk_idx, M=deg)
+                                X[chunk_idx], A[chunk_idx], chunk_keys, chunk_idx, M=deg,
+                                primary_dim=self.primary_dim, storage_dir=self.storage_dir)
             self.router.add_leaf(leaf)
             k_start = k_end
 
