@@ -26,6 +26,7 @@ except ImportError:
 from hilbert_btree import (
     HilbertSpace,
     LeafSubgraph,
+    LeafColumnarStorage,
     GraphSparsityTuner,
     MapReduceCollation,
     interleave_subspace_keys,
@@ -363,16 +364,34 @@ class DistributedShardedHNSW:
         self.offs = faiss.vector_to_array(h.offsets)
         self.nb0 = h.nb_neighbors(0)
 
+        # Parquet-style columnar storage file for shard attributes (enabling column projection & chunk skipping)
+        self.columnar_store = LeafColumnarStorage(
+            leaf_id=1000 + self.rank,
+            secondary_attrs=self.A_local,
+            col_names=[f"attr_{i}" for i in range(self.m)],
+        )
+
         self.comm.Barrier()
+
+    def close(self):
+        """Closes the shard columnar storage file."""
+        if hasattr(self, "columnar_store") and self.columnar_store is not None:
+            self.columnar_store.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def dist_sq(self, q, idxs):
         diff = self.X_local[idxs] - q
         return np.einsum("ij,ij->i", diff, diff)
 
     def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64, mode="beam"):
-        """Executes distributed search over traditional sharded HNSW graph.
+        """Executes distributed search over traditional sharded HNSW graph with columnar attribute filtering.
 
-        mode: 'beam' (in-graph filtered beam search) or 'post' (post-filtering).
+        mode: 'beam' (in-graph filtered beam search via Parquet-style columnar store) or 'post' (post-filtering).
         """
         payload = (q, lo_raw, hi_raw, k, ef, mode) if self.rank == 0 else None
         q, lo_raw, hi_raw, k, ef, mode = self.comm.bcast(payload, root=0)
@@ -390,12 +409,14 @@ class DistributedShardedHNSW:
             local_ids = self.gids_local[local_res]
             local_ndis = self.index.hnsw.efSearch * 2
         elif mode == "post":
-            # Distributed Post-Filtering
+            # Distributed Post-Filtering with Parquet-style columnar evaluation
             self.index.hnsw.efSearch = ef
             D, I = self.index.search(q[None], ef)
+            matching_local_ids = self.columnar_store.filter_secondary(lo_raw, hi_raw)
+            valid_mask = np.zeros(self.n_local, dtype=bool)
+            valid_mask[matching_local_ids] = True
             local_matches = []
             local_match_dists = []
-            valid_mask = np.all((self.A_local >= lo_raw) & (self.A_local <= hi_raw), axis=1)
             for dist, idx in zip(D[0], I[0]):
                 if idx >= 0 and valid_mask[idx]:
                     local_matches.append(self.gids_local[idx])
@@ -406,8 +427,10 @@ class DistributedShardedHNSW:
             local_dists = np.array(local_match_dists, dtype=np.float32)
             local_ndis = ef * 2
         else:
-            # Distributed In-Graph Filtered Beam Search
-            valid_mask = np.all((self.A_local >= lo_raw) & (self.A_local <= hi_raw), axis=1)
+            # Distributed In-Graph Filtered Beam Search with Parquet-style columnar evaluation
+            matching_local_ids = self.columnar_store.filter_secondary(lo_raw, hi_raw)
+            valid_mask = np.zeros(self.n_local, dtype=bool)
+            valid_mask[matching_local_ids] = True
             self.index.hnsw.efSearch = 16
             _, I = self.index.search(q[None], 4)
             seeds = [i for i in I[0] if i >= 0]
@@ -488,7 +511,8 @@ class DistributedShardedHNSW:
         graph_bytes = max(0, faiss_bytes - vec_bytes)
         attr_bytes = self.A_local.nbytes
         id_bytes = self.gids_local.nbytes
-        total_bytes = faiss_bytes + attr_bytes + id_bytes
+        col_file_bytes = self.columnar_store.file_size_bytes if hasattr(self, "columnar_store") and self.columnar_store else 0
+        total_bytes = faiss_bytes + attr_bytes + id_bytes + col_file_bytes
         return {
             "rank": self.rank,
             "num_vectors": self.n_local,
@@ -496,5 +520,6 @@ class DistributedShardedHNSW:
             "total_mb": total_bytes / (1024 * 1024),
             "vec_mb": vec_bytes / (1024 * 1024),
             "graph_mb": graph_bytes / (1024 * 1024),
-            "aux_mb": (attr_bytes + id_bytes) / (1024 * 1024),
+            "aux_mb": (attr_bytes + id_bytes + col_file_bytes) / (1024 * 1024),
+            "col_file_mb": col_file_bytes / (1024 * 1024),
         }

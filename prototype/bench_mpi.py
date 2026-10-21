@@ -257,6 +257,7 @@ def run_mpi_benchmark():
         print("Distributed Comparative Benchmark Completed Successfully!")
         print("=" * 115)
 
+    engine_sharded.close()
     engine_hilbert.close()
 
 
